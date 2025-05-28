@@ -105,8 +105,8 @@ async def verify(verification: VerifyCode):
                 logger.info(f"User created: {verification.email}")
 
                 # Удаляем временные данные из Redis
-                await redis_client.delete(f"reg_confirm:{verification.email}")
-                await redis_client.delete(f"pwd_hash:{verification.email}")
+                await redis_client.client.delete(f"reg_confirm:{verification.email}")
+                await redis_client.client.delete(f"pwd_hash:{verification.email}")
 
                 # Генерируем JWT токен
                 access_token = create_access_token(data={"sub": user.email})

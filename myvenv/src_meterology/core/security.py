@@ -1,4 +1,5 @@
 import logging
+import ssl
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
@@ -63,6 +64,9 @@ async def send_verification_email(email: str, code: str) -> bool:
         return False
 
     try:
+        # Проверка параметров
+        logger.debug(f"Preparing email to {email} via {settings.EMAIL_HOST}:{settings.EMAIL_PORT}")
+
         # Создание сообщения
         message = MIMEMultipart("alternative")
         message["From"] = settings.EMAIL_HOST_USER
@@ -95,23 +99,41 @@ async def send_verification_email(email: str, code: str) -> bool:
         message.attach(MIMEText(text, "plain", "utf-8"))
         message.attach(MIMEText(html, "html", "utf-8"))
 
-        # Упрощенное создание SMTP-клиента
+        # Настройка SSL контекста
+        ssl_context = None
+        if settings.EMAIL_USE_SSL:
+            ssl_context = ssl.create_default_context()
+
+        # Создание SMTP клиента
         smtp = aiosmtplib.SMTP(
             hostname=settings.EMAIL_HOST,
             port=settings.EMAIL_PORT,
-            use_tls=settings.EMAIL_USE_SSL
+            use_tls=settings.EMAIL_USE_SSL,
+            tls_context=ssl_context,
+            start_tls=False  # Для порта 465 не нужно использовать STARTTLS
         )
 
+        logger.debug("Connecting to SMTP server...")
         await smtp.connect()
-        if not settings.EMAIL_USE_SSL:
-            await smtp.starttls()  # Явный STARTTLS
 
+        # Для порта 587 используем STARTTLS, для 465 - нет
+        if not settings.EMAIL_USE_SSL:
+            await smtp.starttls()
+            logger.debug("STARTTLS negotiation completed")
+
+        logger.debug("Authenticating...")
         await smtp.login(
             settings.EMAIL_HOST_USER,
             settings.EMAIL_HOST_PASSWORD
         )
+        logger.debug("Authentication successful")
+
+        logger.debug("Sending email...")
         await smtp.send_message(message)
+        logger.debug("Email sent successfully")
+
         await smtp.quit()
+        logger.info(f"Verification email sent to {email}")
         return True
 
     except Exception as e:
