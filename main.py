@@ -1,87 +1,88 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
-from myvenv.src_meterology.core.config import settings
-from myvenv.src_meterology.routers import auth
-from myvenv.src_meterology.db.database import database
-from myvenv.src_meterology.core.redis import redis_client
 import logging
 import asyncio
+from sqlalchemy import text
 
-# Настройка логгера
-logger = logging.getLogger(__name__)
+from myvenv.src.core.config import settings
+from myvenv.src.core.redis import redis_client
+from myvenv.src.db.database import database
+from myvenv.src.routers import auth
+from myvenv.meteorology.routers import router as weather_router
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Управление жизненным циклом приложения"""
     logger.info("🚀 Starting application initialization...")
 
     try:
-        # Подключение к базе данных
-        logger.info("🔌 Connecting to database...")
+        # Подключение и миграция БД
+        logger.info("🔌 Connecting to database and creating tables...")
         await database.connect()
 
-        # Инициализация Redis
+        # Проверка подключения с использованием text()
+        async with database.get_session() as session:
+            await session.execute(text("SELECT 1"))  # Исправлено здесь
+            logger.info("✅ Database connection verified")
+
+        # Redis
         logger.info("🔗 Connecting to Redis...")
         await redis_client.initialize(settings.REDIS_URL)
         app.state.redis = redis_client
 
-        logger.info("✅ Application initialization completed successfully")
+        logger.info("✅ All services initialized")
         yield
 
     except Exception as e:
-        logger.error(f"❌ Application initialization failed: {e}")
-        # Принудительная задержка для диагностики
+        logger.critical(f"❌ Initialization failed: {e}")
         await asyncio.sleep(5)
         raise
 
     finally:
-        logger.info("🛑 Shutting down application...")
+        logger.info("🛑 Shutting down...")
+        cleanup_tasks = [
+            ("Database", database.disconnect() if database.is_connected else None),
+            ("Redis", redis_client.close() if redis_client.is_initialized else None)
+        ]
 
-        # Закрытие подключений с обработкой ошибок
-        if database.is_connected:
-            try:
-                logger.info("🔌 Disconnecting from database...")
-                await database.disconnect()
-            except Exception as e:
-                logger.error(f"❌ Error disconnecting database: {e}")
-
-        if redis_client.is_initialized:
-            try:
-                logger.info("🔗 Closing Redis connection...")
-                await redis_client.close()
-            except Exception as e:
-                logger.error(f"❌ Error closing Redis: {e}")
-
-        logger.info("👋 Application shutdown completed")
+        for service, task in cleanup_tasks:
+            if task:
+                try:
+                    await task
+                    logger.info(f"🔌 {service} disconnected")
+                except Exception as e:
+                    logger.error(f"❌ Error disconnecting {service}: {e}")
 
 
 app = FastAPI(
     title=settings.APP_NAME,
-    description="Сервис аутентификации с двухфакторной верификацией",
-    version="1.0.0",
     lifespan=lifespan,
-    docs_url="/docs",
-    redoc_url="/redoc"
+    docs_url="/docs"
 )
 
-# Подключение роутеров
-app.include_router(auth.router, prefix="/auth", tags=["Authentication"])
+app.include_router(auth.router, prefix="/auth", tags=["auth"])
+app.include_router(weather_router, prefix="/weather", tags=["weather"])
 
+# if __name__ == "__main__":
+#     import uvicorn
+#
+#     uvicorn.run(
+#         app,
+#         host="0.0.0.0",
+#         port=8000,
+#         reload=settings.is_development
+#     )
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(
         app,
         host="127.0.0.1",
         port=8000,
-        log_config=None,
-        access_log=True,
         reload=settings.is_development
     )
-    # server = uvicorn.Server(config)
-    # loop.run_until_complete(server.serve())
