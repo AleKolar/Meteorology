@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import List, Optional, Sequence
+from typing import Optional
 import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -65,47 +65,42 @@ async def get_or_create_location(db: AsyncSession, query: str) -> Location:
     return location
 
 
-async def fetch_weather_data(location: Location) -> WeatherResponse:
-    """Получает данные о погоде для местоположения"""
+async def fetch_weather_data(location: Location) -> Optional[WeatherResponse]:
+    """Безопасное получение данных о погоде с обработкой ошибок"""
     try:
-        params = {
-            "latitude": location.latitude,
-            "longitude": location.longitude,
-            "current": "temperature_2m,weather_code,precipitation,pressure_msl,windspeed_10m,relative_humidity_2m",
-            "hourly": "temperature_2m",
-            "daily": "temperature_2m_max,temperature_2m_min",
-            "timezone": location.timezone
-        }
+        async with httpx.AsyncClient(verify=False, timeout=30.0) as client:
+            params = {
+                "latitude": location.latitude,
+                "longitude": location.longitude,
+                "current": "temperature_2m,weather_code,precipitation,pressure_msl,wind_speed_10m,relative_humidity_2m",
+                "hourly": "temperature_2m",
+                "daily": "temperature_2m_max,temperature_2m_min",
+                "timezone": location.timezone or "auto",
+                "forecast_days": 1
+            }
 
-        async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(WEATHER_API_URL, params=params)
             response.raise_for_status()
             data = response.json()
 
-            current = data["current"]
-            hourly = data["hourly"]
-            daily = data["daily"]
-
+            current = data.get("current", {})
             return WeatherResponse(
                 city=location.name,
                 country=location.country,
-                temperature=current["temperature_2m"],
-                weather_code=current["weather_code"],
-                precipitation=current["precipitation"],
-                pressure=current["pressure_msl"],
-                windspeed=current["windspeed_10m"],
-                humidity=current["relative_humidity_2m"],
-                hourly_temperatures=hourly["temperature_2m"][:24],
-                max_temperature=daily["temperature_2m_max"][0],  # Макс. сегодня
-                min_temperature=daily["temperature_2m_min"][0],  # Мин. сегодня
+                temperature=current.get("temperature_2m"),
+                weather_code=current.get("weather_code"),
+                precipitation=current.get("precipitation", 0),
+                pressure=current.get("pressure_msl"),
+                windspeed=current.get("wind_speed_10m"),
+                humidity=current.get("relative_humidity_2m"),
+                hourly_temperatures=data.get("hourly", {}).get("temperature_2m", [])[:24],
+                max_temperature=data.get("daily", {}).get("temperature_2m_max", [None])[0],
+                min_temperature=data.get("daily", {}).get("temperature_2m_min", [None])[0],
                 last_updated=datetime.now()
             )
-    except httpx.HTTPError as e:
-        logger.error(f"Weather API error: {str(e)}")
-        raise HTTPException(503, "Weather service unavailable")
     except Exception as e:
-        logger.error(f"Unexpected weather error: {str(e)}")
-        raise HTTPException(500, "Internal server error")
+        logger.error(f"Failed to fetch weather: {str(e)}", exc_info=True)
+        return None
 
 
 async def get_weather_by_location_name(
@@ -129,28 +124,30 @@ async def get_weather_by_location_name(
 
 
 async def get_search_history(user_id: int, db: AsyncSession) -> SearchHistoryResponse:
-    """Получение истории поиска с данными о погоде"""
+    """Безопасное получение истории поиска"""
     try:
-        stmt = select(SearchHistory).options(
-            selectinload(SearchHistory.location)
-        ).filter(
-            SearchHistory.user_id == user_id
-        ).order_by(
-            SearchHistory.last_searched.desc()
-        ).limit(10)  # Ограничиваем количество записей
+        # Проверяем существование пользователя
+        user = await db.get(User, user_id)
+        if not user:
+            logger.warning(f"User {user_id} not found")
+            return SearchHistoryResponse(user_id=user_id, history=[])
+
+        stmt = (select(SearchHistory)
+                .options(selectinload(SearchHistory.location))
+                .filter(SearchHistory.user_id == user_id)
+                .order_by(SearchHistory.last_searched.desc())
+                .limit(10))
 
         result = await db.execute(stmt)
-        history = result.scalars().all()
+        history_items = result.scalars().all()
 
         items = []
-        for item in history:
-            # Для каждой записи получаем текущую погоду
+        for item in history_items:
             weather = None
             if item.location:
-                try:
-                    weather = await fetch_weather_data(item.location)
-                except Exception as e:
-                    logger.error(f"Failed to get weather for history item: {str(e)}")
+                weather = await fetch_weather_data(item.location)
+                if not weather:
+                    logger.warning(f"Weather data not available for {item.location.name}")
 
             items.append(SearchHistoryItem(
                 city_name=item.location.name if item.location else item.city_name,
@@ -159,38 +156,42 @@ async def get_search_history(user_id: int, db: AsyncSession) -> SearchHistoryRes
                 current_weather=weather
             ))
 
-        return SearchHistoryResponse(
-            user_id=user_id,
-            history=items
-        )
+        return SearchHistoryResponse(user_id=user_id, history=items)
+
     except Exception as e:
         logger.error(f"History error: {str(e)}", exc_info=True)
         return SearchHistoryResponse(user_id=user_id, history=[])
 
 
 async def save_search_history(
-        user_id: int,
-        location_id: int,
-        location_name: str,
-        db: AsyncSession
-) -> None:
-    """Сохранение истории поиска с проверкой пользователя"""
+    user_id: int,
+    location_id: int,
+    location_name: str,
+    db: AsyncSession
+) -> bool:
+    """Безопасное сохранение истории поиска"""
     try:
-        # Проверяем существование пользователя
-        user_exists = await db.execute(
-            select(User).where(User.id == user_id)
-        )
-        if not user_exists.scalar():
-            logger.warning(f"Пользователь с ID {user_id} не существует")
-            return
+        # Проверяем пользователя
+        user = await db.get(User, user_id)
+        if not user:
+            logger.warning(f"User {user_id} not found")
+            return False
 
-        # Проверяем существующую запись истории
-        stmt = select(SearchHistory).where(
-            SearchHistory.user_id == user_id,
-            SearchHistory.location_id == location_id
+        # Проверяем местоположение
+        location = await db.get(Location, location_id)
+        if not location:
+            logger.warning(f"Location {location_id} not found")
+            return False
+
+        # Ищем существующую запись
+        result = await db.execute(
+            select(SearchHistory)
+            .where(
+                SearchHistory.user_id == user_id,
+                SearchHistory.location_id == location_id
+            )
         )
-        result = await db.execute(stmt)
-        existing = result.scalars().first()
+        existing = result.scalar_one_or_none()
 
         if existing:
             existing.search_count += 1
@@ -205,7 +206,9 @@ async def save_search_history(
             ))
 
         await db.commit()
+        return True
+
     except Exception as e:
         await db.rollback()
-        logger.error(f"Ошибка сохранения истории: {str(e)}")
-        raise
+        logger.error(f"Save history error: {str(e)}", exc_info=True)
+        return False
