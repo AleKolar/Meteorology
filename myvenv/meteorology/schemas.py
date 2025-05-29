@@ -36,6 +36,7 @@ class SearchHistoryItem(BaseModel):
     city_name: str
     search_count: int
     last_searched: datetime
+    current_weather: Optional[WeatherResponse] = None
 
 class SearchHistoryResponse(BaseModel):
     user_id: int

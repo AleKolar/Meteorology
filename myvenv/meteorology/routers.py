@@ -3,13 +3,13 @@ from sqlalchemy import select, func
 
 from myvenv.meteorology.models import Location, SearchHistory
 from myvenv.meteorology.schemas import (
-    WeatherResponse, SearchHistoryResponse,
+    WeatherResponse, SearchHistoryResponse, SearchHistoryItem,
 )
 from myvenv.src.db.database import database
 from .repository import (
     fetch_weather_data,
-    get_search_history,
-    save_search_history, GEOCODING_API_URL, logger
+    get_user_search_history,
+    save_search_history_entry, GEOCODING_API_URL, logger, get_last_search_history
 )
 
 router = APIRouter(prefix="", tags=["weather"])
@@ -117,43 +117,7 @@ async def get_weather(
         logger.error(f"Неожиданная ошибка: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="Внутренняя ошибка сервера")
 
-# @router.get("/suggestions", response_model=List[LocationSuggestion])
-# async def get_suggestions(
-#         query: str,
-#         db: AsyncSession = Depends(database.get_db)
-# ) -> List[LocationSuggestion]:
-#     """
-#     Получение подсказок местоположений по частичному названию.
-#     """
-#     if len(query) < 2:
-#         raise HTTPException(
-#             status_code=400,
-#             detail="Query must be at least 2 characters long"
-#         )
-#
-#     try:
-#         stmt = select(Location).where(
-#             func.lower(Location.name).ilike(f"%{query.lower()}%")
-#         ).limit(10)
-#
-#         result = await db.execute(stmt)
-#         locations = result.scalars().all()
-#
-#         return [
-#             LocationSuggestion(
-#                 id=loc.id,
-#                 name=loc.name,
-#                 country=loc.country,
-#                 admin1=loc.admin1
-#             )
-#             for loc in locations
-#         ]
-#     except Exception as e:
-#         logger.error(f"Location search error: {e}")
-#         raise HTTPException(
-#             status_code=500,
-#             detail="Error searching locations"
-#         )
+
 
 @router.get("/current/{location_id}", response_model=WeatherResponse)
 async def get_current_weather(
@@ -171,7 +135,7 @@ async def get_current_weather(
 
     # Сохраняем в историю, если указан user_id
     if user_id is not None:
-        await save_search_history(user_id, location_id, str(location.name), db)
+        await save_search_history_entry(user_id, location_id, str(location.name), db)
 
     weather = await fetch_weather_data(location)
     if not weather:
@@ -181,13 +145,16 @@ async def get_current_weather(
         )
     return weather
 
-@router.get("/history", response_model=List[SearchHistoryResponse])
-async def get_search_history(
-        user_id: int,
-        db: AsyncSession = Depends(database.get_db)
-) -> List[SearchHistoryResponse]:
-    """ Получение истории поиска погоды для пользователя """
-    return await get_search_history(user_id, db)
+@router.get("/history/last", response_model=SearchHistoryItem)
+async def get_last_history_entry(
+    user_id: int,
+    db: AsyncSession = Depends(database.get_db)
+):
+    """Получение последней записи истории поиска"""
+    last_entry = await get_last_search_history(user_id, db)
+    if not last_entry:
+        raise HTTPException(status_code=404, detail="No history found")
+    return last_entry
 
 
 @router.delete("/history/{record_id}", status_code=204)
