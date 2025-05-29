@@ -7,8 +7,9 @@ from sqlalchemy import text
 from myvenv.src.core.config import settings
 from myvenv.src.core.redis import redis_client
 from myvenv.src.db.database import database
-from myvenv.src.routers import auth
+
 from myvenv.meteorology.routers import router as weather_router
+from myvenv.src.routers.auth import router as auth_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -66,7 +67,7 @@ app = FastAPI(
     docs_url="/docs"
 )
 
-app.include_router(auth.router, prefix="/auth", tags=["auth"])
+app.include_router(auth_router, prefix="/auth", tags=["auth"])
 app.include_router(weather_router, prefix="/weather", tags=["weather"])
 
 # if __name__ == "__main__":

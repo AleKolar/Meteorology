@@ -4,6 +4,7 @@ import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 import logging
+from fastapi import HTTPException
 
 from sqlalchemy.orm import selectinload
 
@@ -13,11 +14,13 @@ from myvenv.meteorology.schemas import (
     SearchHistoryItem,
     SearchHistoryResponse
 )
+from myvenv.src.db.models.models import User
 
 logger = logging.getLogger("weather")
 
 GEOCODING_API_URL = "https://geocoding-api.open-meteo.com/v1/search"
 WEATHER_API_URL = "https://api.open-meteo.com/v1/forecast"
+
 
 async def fetch_locations_from_api(name: str, count: int = 10) -> list[dict]:
     async with httpx.AsyncClient(verify=False) as client:
@@ -28,129 +31,105 @@ async def fetch_locations_from_api(name: str, count: int = 10) -> list[dict]:
         response.raise_for_status()
         return response.json().get("results", [])
 
-async def save_locations(db: AsyncSession, locations: list[dict]):
-    for loc_data in locations:
-        location = Location(
-            name=loc_data.get("name"),
-            latitude=loc_data.get("latitude"),
-            longitude=loc_data.get("longitude"),
-            country=loc_data.get("country"),
-            admin1=loc_data.get("admin1"),
-            timezone=loc_data.get("timezone"),
 
-        )
-        db.add(location)
+async def save_location(db: AsyncSession, loc_data: dict) -> Location:
+    """Сохраняет новое местоположение в базу"""
+    location = Location(
+        name=loc_data.get("name"),
+        latitude=loc_data.get("latitude"),
+        longitude=loc_data.get("longitude"),
+        country=loc_data.get("country"),
+        admin1=loc_data.get("admin1"),
+        timezone=loc_data.get("timezone"),
+    )
+    db.add(location)
     await db.commit()
+    await db.refresh(location)
+    return location
 
-# async def get_location_suggestions(query: str, db: AsyncSession) -> List[LocationSuggestion]:
-#     """Поиск городов"""
-#     try:
-#         # Поиск в кэше (0Варианты написания)
-#         stmt = select(Location).where(
-#             func.lower(Location.name).ilike(f"%{query.lower()}%")
-#         ).limit(10)
-#
-#         result = await db.execute(stmt)
-#         cached = result.scalars().all()
-#
-#         if cached:
-#             return [LocationSuggestion(
-#                 id=loc.id,
-#                 name=loc.name,
-#                 country=loc.country,
-#                 latitude=loc.latitude,
-#                 longitude=loc.longitude
-#             ) for loc in cached]
-#
-#         # Запрос к API
-#         params = {
-#             "name": query,
-#             "count": 10,
-#             "language": "ru",
-#             "format": "json"
-#         }
-#
-#         async with httpx.AsyncClient(timeout=5.0) as client:
-#             response = await client.get(GEOCODING_API_URL, params=params)
-#             response.raise_for_status()
-#             api_data = response.json().get("results", [])
-#
-#         # Сохранение в БД
-#         for loc in api_data:
-#             stmt = insert(Location).values(
-#                 id=loc["id"],
-#                 name=loc["name"],
-#                 country=loc["country"],
-#                 latitude=loc["latitude"],
-#                 longitude=loc["longitude"],
-#                 admin1=loc.get("admin1"),
-#                 timezone=loc.get("timezone", "UTC")
-#             ).on_conflict_do_update(
-#                 index_elements=['id'],
-#                 set_={
-#                     "name": loc["name"],
-#                     "country": loc["country"],
-#                     "latitude": loc["latitude"],
-#                     "longitude": loc["longitude"]
-#                 }
-#             )
-#             await db.execute(stmt)
-#
-#         await db.commit()
-#         return [LocationSuggestion(**loc) for loc in api_data]
-#
-#     except Exception as e:
-#         await db.rollback()
-#         logger.error(f"Location search error: {str(e)}", exc_info=True)
-#         return []
 
-async def get_location_suggestions(db: AsyncSession, query: str, limit: int = 10) -> Sequence[Location]:
-    # Сначала проверяем в базе
-    stmt = select(Location).where(
-        Location.name.ilike(f"%{query}%")
-    ).limit(limit)
+async def get_or_create_location(db: AsyncSession, query: str) -> Location:
+    """Находит или создает местоположение"""
+    # Сначала ищем в базе
+    stmt = select(Location).where(Location.name.ilike(f"%{query}%"))
     result = await db.execute(stmt)
-    locations = result.scalars().all()
+    location = result.scalars().first()
 
-    # Если в базе нет результатов, запрашиваем API
-    if not locations:
-        api_results = await fetch_locations_from_api(query, limit)
-        if api_results:
-            await save_locations(db, api_results)
-            return await get_location_suggestions(db, query, limit)
+    # Если не нашли, запрашиваем API
+    if not location:
+        api_results = await fetch_locations_from_api(query, 1)
+        if not api_results:
+            raise HTTPException(404, "Location not found")
+        location = await save_location(db, api_results[0])
 
-    return locations
+    return location
 
-async def fetch_weather_data(location: Location) -> Optional[WeatherResponse]:
-    """Получение данных о погоде"""
+
+async def fetch_weather_data(location: Location) -> WeatherResponse:
+    """Получает данные о погоде для местоположения"""
     try:
         params = {
             "latitude": location.latitude,
             "longitude": location.longitude,
-            "current": "temperature_2m,precipitation,pressure_msl,windspeed_10m",
+            "current": "temperature_2m,weather_code,precipitation,pressure_msl,windspeed_10m,relative_humidity_2m",
+            "hourly": "temperature_2m",
+            "daily": "temperature_2m_max,temperature_2m_min",
             "timezone": location.timezone
         }
 
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(WEATHER_API_URL, params=params)
             response.raise_for_status()
-            data = response.json()["current"]
+            data = response.json()
+
+            current = data["current"]
+            hourly = data["hourly"]
+            daily = data["daily"]
 
             return WeatherResponse(
                 city=location.name,
-                temperature=data["temperature_2m"],
-                precipitation=data["precipitation"],
-                pressure=data["pressure_msl"],
-                windspeed=data["windspeed_10m"],
+                country=location.country,
+                temperature=current["temperature_2m"],
+                weather_code=current["weather_code"],
+                precipitation=current["precipitation"],
+                pressure=current["pressure_msl"],
+                windspeed=current["windspeed_10m"],
+                humidity=current["relative_humidity_2m"],
+                hourly_temperatures=hourly["temperature_2m"][:24],
+                max_temperature=daily["temperature_2m_max"][0],  # Макс. сегодня
+                min_temperature=daily["temperature_2m_min"][0],  # Мин. сегодня
                 last_updated=datetime.now()
             )
+    except httpx.HTTPError as e:
+        logger.error(f"Weather API error: {str(e)}")
+        raise HTTPException(503, "Weather service unavailable")
     except Exception as e:
-        logger.error(f"Weather data error: {str(e)}")
-        return None
+        logger.error(f"Unexpected weather error: {str(e)}")
+        raise HTTPException(500, "Internal server error")
+
+
+async def get_weather_by_location_name(
+        query: str,
+        user_id: Optional[int] = None,
+        db: AsyncSession = None
+) -> WeatherResponse:
+    """Основная функция для получения погоды по названию места"""
+    if len(query) < 2:
+        raise HTTPException(400, "Query too short")
+
+    # Получаем или создаем местоположение
+    location = await get_or_create_location(db, query)
+
+    # Сохраняем в историю поиска, если указан user_id
+    if user_id and db:
+        await save_search_history(user_id, location.id, location.name, db)
+
+    # Получаем данные о погоде
+    return await fetch_weather_data(location)
 
 
 async def get_search_history(user_id: int, db: AsyncSession) -> SearchHistoryResponse:
-    """Исправленный запрос истории"""
+    """Получение истории поиска с данными о погоде"""
     try:
         stmt = select(SearchHistory).options(
             selectinload(SearchHistory.location)
@@ -158,20 +137,31 @@ async def get_search_history(user_id: int, db: AsyncSession) -> SearchHistoryRes
             SearchHistory.user_id == user_id
         ).order_by(
             SearchHistory.last_searched.desc()
-        )
+        ).limit(10)  # Ограничиваем количество записей
 
         result = await db.execute(stmt)
         history = result.scalars().all()
 
+        items = []
+        for item in history:
+            # Для каждой записи получаем текущую погоду
+            weather = None
+            if item.location:
+                try:
+                    weather = await fetch_weather_data(item.location)
+                except Exception as e:
+                    logger.error(f"Failed to get weather for history item: {str(e)}")
+
+            items.append(SearchHistoryItem(
+                city_name=item.location.name if item.location else item.city_name,
+                last_searched=item.last_searched,
+                search_count=item.search_count,
+                current_weather=weather
+            ))
+
         return SearchHistoryResponse(
             user_id=user_id,
-            history=[
-                SearchHistoryItem(
-                    city_name=item.location.name if item.location else item.city_name,
-                    last_searched=item.last_searched,
-                    search_count=item.search_count
-                ) for item in history
-            ]
+            history=items
         )
     except Exception as e:
         logger.error(f"History error: {str(e)}", exc_info=True)
@@ -184,9 +174,18 @@ async def save_search_history(
         location_name: str,
         db: AsyncSession
 ) -> None:
-    """Сохранение истории поиска"""
+    """Сохранение истории поиска с проверкой пользователя"""
     try:
-        stmt = select(SearchHistory).filter(
+        # Проверяем существование пользователя
+        user_exists = await db.execute(
+            select(User).where(User.id == user_id)
+        )
+        if not user_exists.scalar():
+            logger.warning(f"Пользователь с ID {user_id} не существует")
+            return
+
+        # Проверяем существующую запись истории
+        stmt = select(SearchHistory).where(
             SearchHistory.user_id == user_id,
             SearchHistory.location_id == location_id
         )
@@ -208,5 +207,5 @@ async def save_search_history(
         await db.commit()
     except Exception as e:
         await db.rollback()
-        logger.error(f"Save history error: {str(e)}")
+        logger.error(f"Ошибка сохранения истории: {str(e)}")
         raise

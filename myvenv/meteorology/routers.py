@@ -1,16 +1,11 @@
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-from typing import List, Optional
+from fastapi import APIRouter
+from sqlalchemy import select, func
 
 from myvenv.meteorology.models import Location, SearchHistory
 from myvenv.meteorology.schemas import (
-    LocationSuggestion,
-    WeatherResponse,
-    SearchHistoryResponse
+    WeatherResponse, SearchHistoryResponse,
 )
 from myvenv.src.db.database import database
-import httpx
 from .repository import (
     fetch_weather_data,
     get_search_history,
@@ -19,50 +14,108 @@ from .repository import (
 
 router = APIRouter(prefix="", tags=["weather"])
 
+from fastapi import HTTPException, Depends
+from typing import Optional, List
+import httpx
+from sqlalchemy.ext.asyncio import AsyncSession
+from datetime import datetime
 
-@router.get("/weather/suggestions", response_model=List[LocationSuggestion])
-async def get_suggestions(
-        query: str,
-        limit: int = 10,
-        country: Optional[str] = None,
+WEATHER_API_URL = "https://api.open-meteo.com/v1/forecast"
+
+
+@router.get("/weather/{city_name}", response_model=WeatherResponse)
+async def get_weather(
+        city_name: str,
+        user_id: Optional[int] = None,
         db: AsyncSession = Depends(database.get_db)
-) -> List[LocationSuggestion]:
+) -> WeatherResponse:
     """
-    Получение подсказок местоположений через Open-Meteo API
+    Получение погоды по названию города (без SSL верификации)
     """
-    if len(query) < 2:
-        raise HTTPException(400, "Query must be at least 2 characters")
+    if len(city_name) < 2:
+        raise HTTPException(400, "Название города должно содержать минимум 2 символа")
 
     try:
-        # Получаем данные из API
-        async with httpx.AsyncClient(verify=False) as client:
-            response = await client.get(
-                GEOCODING_API_URL,
-                params={"name": query, "count": limit, "language": "en"}
-            )
-            response.raise_for_status()
-            locations = response.json().get("results", [])
+        # Настройка HTTP-клиента без SSL верификации
+        client_params = {
+            "timeout": 30.0,
+            "verify": False  # Отключаем проверку SSL
+        }
 
-        return [
-            LocationSuggestion(
-                id=idx,
-                name=loc.get("name"),
-                country=loc.get("country"),
-                admin1=loc.get("admin1"),
-                latitude=loc.get("latitude"),
-                longitude=loc.get("longitude"),
-                timezone=loc.get("timezone")
-            )
-            for idx, loc in enumerate(locations, 1)
-        ]
+        # Поиск города в базе или через API
+        async with httpx.AsyncClient(**client_params) as client:
+            # Сначала ищем в базе
+            result = await db.execute(
+                select(Location).where(Location.name.ilike(f"%{city_name}%")))
+            location = result.scalars().first()
 
-    except httpx.HTTPError as e:
-        logger.error(f"API request failed: {e}")
-        raise HTTPException(502, "Geocoding service unavailable")
+            if not location:
+                # Запрос к API геокодинга
+                geo_response = await client.get(
+                    GEOCODING_API_URL,
+                    params={"name": city_name, "count": 1, "language": "en"}
+                )
+                geo_response.raise_for_status()
+
+                locations = geo_response.json().get("results", [])
+                if not locations:
+                    raise HTTPException(404, "Город не найден")
+
+                # Сохраняем в базу
+                loc_data = locations[0]
+                location = Location(
+                    name=loc_data.get("name"),
+                    country=loc_data.get("country"),
+                    latitude=loc_data.get("latitude"),
+                    longitude=loc_data.get("longitude"),
+                    admin1=loc_data.get("admin1", ""),
+                    timezone=loc_data.get("timezone", "UTC")
+                )
+                db.add(location)
+                await db.commit()
+                await db.refresh(location)
+
+            # 3. Запрос погоды
+            weather_params = {
+                "latitude": location.latitude,
+                "longitude": location.longitude,
+                "current": "temperature_2m,weather_code,precipitation,pressure_msl,wind_speed_10m,relative_humidity_2m",
+                "hourly": "temperature_2m",
+                "daily": "temperature_2m_max,temperature_2m_min",
+                "timezone": location.timezone,
+                "forecast_days": 1
+            }
+
+            weather_response = await client.get(WEATHER_API_URL, params=weather_params)
+            weather_response.raise_for_status()
+            weather_data = weather_response.json()
+
+        # 4. Формирование ответа
+        current = weather_data.get("current", {})
+        return WeatherResponse(
+            city=location.name,
+            country=location.country,
+            temperature=current.get("temperature_2m"),
+            weather_code=current.get("weather_code"),
+            precipitation=current.get("precipitation", 0),
+            pressure=current.get("pressure_msl"),
+            windspeed=current.get("wind_speed_10m"),
+            humidity=current.get("relative_humidity_2m"),
+            hourly_temperatures=weather_data.get("hourly", {}).get("temperature_2m", [])[:24],
+            max_temperature=weather_data.get("daily", {}).get("temperature_2m_max", [None])[0],
+            min_temperature=weather_data.get("daily", {}).get("temperature_2m_min", [None])[0],
+            last_updated=datetime.now()
+        )
+
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Ошибка API: {str(e)}")
+        raise HTTPException(status_code=502, detail="Сервис погоды временно недоступен")
+    except httpx.RequestError as e:
+        logger.error(f"Ошибка соединения: {str(e)}")
+        raise HTTPException(status_code=503, detail="Не удалось подключиться к сервису погоды")
     except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        raise HTTPException(500, "Internal server error")
-
+        logger.error(f"Неожиданная ошибка: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Внутренняя ошибка сервера")
 
 # @router.get("/suggestions", response_model=List[LocationSuggestion])
 # async def get_suggestions(

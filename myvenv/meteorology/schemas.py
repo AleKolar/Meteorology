@@ -19,10 +19,16 @@ class LocationSuggestion(BaseModel):
 
 class WeatherResponse(BaseModel):
     city: str
+    country: str
     temperature: float
+    weather_code: int
     precipitation: float
     pressure: float
     windspeed: float
+    humidity: float
+    hourly_temperatures: List[float]
+    max_temperature: float
+    min_temperature: float
     last_updated: datetime
 
 class SearchHistoryItem(BaseModel):

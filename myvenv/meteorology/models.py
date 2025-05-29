@@ -1,6 +1,6 @@
 from sqlalchemy import Column, String, Float, Integer, DateTime, Index, ForeignKey
 from sqlalchemy.orm import relationship, declared_attr
-
+from sqlalchemy.dialects.postgresql import TSVECTOR
 from myvenv.src.db.base import Base
 
 
@@ -15,14 +15,24 @@ class Location(Base):
     admin1 = Column(String(100), nullable=True)
     timezone = Column(String(50), default="UTC")
 
+    # Добавляем TSVECTOR поле для полнотекстового поиска
+    search_vector = Column(TSVECTOR)
+
     searches = relationship("SearchHistory", back_populates="location")
 
     @declared_attr
     def __table_args__(cls):
         return (
+            # Обычный B-tree индекс
             Index('idx_location_name', 'name'),
-            Index('idx_location_name_trgm', 'name', postgresql_using='gin',
-                  postgresql_ops={'name': 'gin_trgm_ops'}),
+
+            # GIN-индекс для поиска
+            Index('idx_location_search_vector', 'search_vector', postgresql_using='gin'),
+
+            # Дополнительный индекс для поиска по шаблону
+            Index('idx_location_name_pattern', 'name',
+                  postgresql_using='btree',
+                  postgresql_ops={'name': 'varchar_pattern_ops'})
         )
 
 

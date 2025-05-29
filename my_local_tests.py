@@ -33,15 +33,20 @@
 # cert_path = r'C:\Users\User\pythonProject\Deduplicator_python_fastapi\Meteorology\Lib\site-packages\certifi\cacert.pem'
 # print(os.path.exists(cert_path))
 
-import requests
+# import requests
+#
+# url = "https://geocoding-api.open-meteo.com/v1/search"
+# params = {
+#     "name": "Moscow",
+#     "count": 10,
+#     "language": "en",
+#     "format": "json",
+# }
+#
+# response = requests.get(url, params=params)
+# print(response.json())
 
-url = "https://geocoding-api.open-meteo.com/v1/search"
-params = {
-    "name": "Moscow",
-    "count": 10,
-    "language": "en",
-    "format": "json",
-}
+from sqlalchemy import inspect, engine
 
-response = requests.get(url, params=params)
-print(response.json())
+inspector = inspect(engine)
+print(inspector.get_columns('search_history'))
